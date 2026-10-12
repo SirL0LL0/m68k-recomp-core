@@ -1379,6 +1379,14 @@ static int probe_offset_table_targets(const GenesisRom *rom,
  * ========================================================================= */
 static int sasc_switch_bound(const GenesisRom *rom, uint32_t m_addr, int xreg)
 {
+    /* the index may be doubled between the check and the move:
+     * add.w Dn,Dn / asl.w #1,Dn / lsl.w #1,Dn */
+    {
+        uint16_t pw = rom_read16(rom, m_addr - 2);
+        if (pw == (uint16_t)(0xD040 | xreg << 9 | xreg) || pw == (uint16_t)(0xE340 | xreg) ||
+            pw == (uint16_t)(0xE348 | xreg))
+            m_addr -= 2;
+    }
     /* the Bcc right before the move: .b (2 bytes) or .w (4 bytes) */
     for (int bl = 2; bl <= 4; bl += 2) {
         if (m_addr < (uint32_t)bl + 6) continue;
