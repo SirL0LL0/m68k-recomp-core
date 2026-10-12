@@ -69,6 +69,20 @@ static int ea_ext_words(int mode, int reg, M68KSize size) {
     }
 }
 
+/* 68020 full-format index extension (bit 8 set): the words that follow the
+ * extension word itself — base displacement (BD SIZE, bits 5-4: 1 null,
+ * 2 word, 3 long) and outer displacement (I/IS low bits: 2 word, 3 long). */
+int m68k_full_ext_extra_words(uint16_t ext) {
+    if (!(ext & 0x0100)) return 0;
+    int n = 0;
+    switch ((ext >> 4) & 3) { case 2: n += 1; break; case 3: n += 2; break; }
+    switch (ext & 3) {
+    case 2: if (ext & 7) n += 1; break;
+    case 3: n += 2; break;
+    }
+    return n;
+}
+
 /* ---- Consume EA extension words into out->words ---- */
 
 static void consume_ea_ext(const GenesisRom *rom, uint32_t *pc,
@@ -77,6 +91,12 @@ static void consume_ea_ext(const GenesisRom *rom, uint32_t *pc,
     int n = ea_ext_words(mode, reg, size);
     for (int i = 0; i < n; i++) {
         out->words[out->word_count++] = fetch16(rom, pc);
+    }
+    /* indexed modes: a 68020 full-format extension word carries more words */
+    if (mode == EA_An_IDX || (mode == EA_PCR && reg == PCR_PC_IDX)) {
+        int extra = m68k_full_ext_extra_words(out->words[out->word_count - 1]);
+        for (int i = 0; i < extra && out->word_count < M68K_MAX_WORDS; i++)
+            out->words[out->word_count++] = fetch16(rom, pc);
     }
 }
 
@@ -338,7 +358,7 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
                     out->target_addr = pc - 2 + (int32_t)disp;
                     out->has_target  = true;
                 } else if (ea_reg == PCR_PC_IDX) {
-                    out->words[out->word_count++] = fetch16(rom, &pc);
+                    consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
                     /* dynamic, no static target */
                 } else if (ea_reg == PCR_ABS_W) {
                     uint16_t aw = fetch16(rom, &pc);
@@ -354,7 +374,7 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
             } else if (ea_mode == EA_An_DISP) {
                 out->words[out->word_count++] = fetch16(rom, &pc);
             } else if (ea_mode == EA_An_IDX) {
-                out->words[out->word_count++] = fetch16(rom, &pc);
+                consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
             } else {
                 consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
             }
@@ -380,7 +400,7 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
                     out->target_addr = pc - 2 + (int32_t)disp;
                     out->has_target  = true;
                 } else if (ea_reg == PCR_PC_IDX) {
-                    out->words[out->word_count++] = fetch16(rom, &pc);
+                    consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
                     /* dynamic */
                 } else if (ea_reg == PCR_ABS_W) {
                     uint16_t aw = fetch16(rom, &pc);
@@ -395,10 +415,31 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
             } else if (ea_mode == EA_An_DISP) {
                 out->words[out->word_count++] = fetch16(rom, &pc);
             } else if (ea_mode == EA_An_IDX) {
-                out->words[out->word_count++] = fetch16(rom, &pc);
+                consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
             } else {
                 consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
             }
+            break;
+        }
+
+        /* EXTB.L Dn (68020): 0100 1001 1100 0rrr. Must precede LEA, whose
+         * mask would take it as LEA with the (illegal) Dn mode. */
+        if ((w0 & 0xFFF8) == 0x49C0) {
+            out->mnemonic = MN_EXTB;
+            out->size     = M68K_SIZE_L;
+            out->reg      = ea_reg;
+            break;
+        }
+
+        /* MULU.L/MULS.L <ea>,Dl[:Dh] (0x4C00) and DIVU.L/DIVS.L <ea>,Dr:Dq
+         * (0x4C40), 68020. One operation word (registers, signedness, 64-bit
+         * form) then the EA extension. Must precede NEG, whose mask matches. */
+        if ((w0 & 0xFFC0) == 0x4C00 || (w0 & 0xFFC0) == 0x4C40) {
+            out->mnemonic = (w0 & 0x0040) ? MN_DIVL : MN_MULL;
+            out->size     = M68K_SIZE_L;
+            out->src_ea   = w0 & 0x3F;
+            out->words[out->word_count++] = fetch16(rom, &pc);
+            consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
             break;
         }
 
@@ -992,6 +1033,21 @@ bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out) {
         int ea_mode = (w0 >> 3) & 7;
         int ea_reg  = w0 & 7;
         int bits76  = (w0 >> 6) & 3;
+
+        /* Bit field instructions (68020): 1110 1ooo 11 mmm rrr, then one
+         * extension word (register, offset, width). imm32 holds the
+         * operation: 0 BFTST, 1 BFEXTU, 2 BFCHG, 3 BFEXTS, 4 BFCLR,
+         * 5 BFFFO, 6 BFSET, 7 BFINS. */
+        if (bits76 == 3 && (w0 & 0x0800)) {
+            out->mnemonic = MN_BITFIELD;
+            out->size     = M68K_SIZE_L;
+            out->imm32    = (w0 >> 8) & 7;
+            out->src_ea   = w0 & 0x3F;
+            out->words[out->word_count++] = fetch16(rom, &pc);
+            out->reg      = (out->words[1] >> 12) & 7;
+            consume_ea_ext(rom, &pc, out, ea_mode, ea_reg, M68K_SIZE_L);
+            break;
+        }
 
         /* Memory shifts: bits 7-6 == 11 */
         if (bits76 == 3) {

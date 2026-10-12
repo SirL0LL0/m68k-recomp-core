@@ -194,6 +194,48 @@ static int ea_ext_words_count(int mode, int reg, M68KSize size) {
     }
 }
 
+/* Same, for the EA whose extension starts at instr->words[wi]: indexed
+ * modes add the words of a 68020 full-format extension. */
+static int ea_ext_words_at(const M68KInstr *instr, int wi, int mode, int reg,
+                           M68KSize size) {
+    int n = ea_ext_words_count(mode, reg, size);
+    if ((mode == 6 || (mode == 7 && reg == 3)) && wi < instr->word_count)
+        n += m68k_full_ext_extra_words(instr->words[wi]);
+    return n;
+}
+
+/* Address of an indexed EA — (d8,An,Xn) or (d8,PC,Xn) — in brief or 68020
+ * full format, as a C expression. `an` is the base register, or -1 for the
+ * PC form (pc_addr = address of the extension word). The scale factor is
+ * applied by m68k_brief_index_value(); the full format (base and outer
+ * displacements, suppressed base/index, memory indirection) by
+ * m68k_full_index_ea(). Both live in the runner's genesis_runtime.h. */
+static void emit_index_ea(ExtReader *er, int an, uint32_t pc_addr,
+                          bool u_suffix, char *out, size_t n) {
+    uint16_t ext = er_next(er);
+    int xreg = (ext >> 12) & 7;
+    char base[64];
+    if (an >= 0) snprintf(base, sizeof base, "g_cpu.A[%d]", an);
+    else snprintf(base, sizeof base, u_suffix ? "0x%08Xu" : "0x%08X", pc_addr);
+    if (!(ext & 0x0100)) {
+        int8_t d8 = (int8_t)(ext & 0xFF);
+        snprintf(out, n, "(uint32_t)(%s + m68k_brief_index_value(0x%04Xu, "
+                 "g_cpu.D[%d], g_cpu.A[%d]) + (%d))", base, ext, xreg, xreg, (int)d8);
+        return;
+    }
+    uint32_t bd = 0, od = 0;
+    switch ((ext >> 4) & 3) {
+    case 2: bd = (uint32_t)(int32_t)(int16_t)er_next(er); break;
+    case 3: bd = er_next_dword(er); break;
+    }
+    switch (ext & 3) {
+    case 2: if (ext & 7) od = (uint32_t)(int32_t)(int16_t)er_next(er); break;
+    case 3: od = er_next_dword(er); break;
+    }
+    snprintf(out, n, "m68k_full_index_ea(%s, 0x%04Xu, 0x%08Xu, 0x%08Xu, "
+             "g_cpu.D[%d], g_cpu.A[%d])", base, ext, bd, od, xreg, xreg);
+}
+
 /* =========================================================================
  * Size helpers
  * ========================================================================= */
@@ -441,12 +483,9 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
         break;
     }
     case 6: { /* (d8,An,Xn) */
-        uint16_t ext = er_next(er);
-        int      xreg  = (ext >> 12) & 7;
-        int8_t   d8    = (int8_t)(ext & 0xFF);
-        fprintf(f, "  %s %s = %s((uint32_t)(g_cpu.A[%d] + "
-                "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d)));\n",
-                ct, tmp, rf, reg, ext, xreg, xreg, (int)d8);
+        char ea_s[200];
+        emit_index_ea(er, reg, 0, false, ea_s, sizeof ea_s);
+        fprintf(f, "  %s %s = %s(%s);\n", ct, tmp, rf, ea_s);
         snprintf(out_expr, 256, "%s", tmp);
         break;
     }
@@ -478,12 +517,9 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
         }
         case 3: { /* (d8,PC,Xn) */
             uint32_t pc_addr = instr->addr + er->bp;
-            uint16_t ext = er_next(er);
-            int      xreg  = (ext >> 12) & 7;
-            int8_t   d8    = (int8_t)(ext & 0xFF);
-            fprintf(f, "  %s %s = %s((uint32_t)(0x%08X + "
-                    "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d)));\n",
-                    ct, tmp, rf, pc_addr, ext, xreg, xreg, (int)d8);
+            char ea_s[200];
+            emit_index_ea(er, -1, pc_addr, false, ea_s, sizeof ea_s);
+            fprintf(f, "  %s %s = %s(%s);\n", ct, tmp, rf, ea_s);
             snprintf(out_expr, 256, "%s", tmp);
             break;
         }
@@ -548,16 +584,9 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
         snprintf(out_expr, 256, "(uint32_t)(g_cpu.A[%d] + (int32_t)%d)", reg, (int)d16);
         break;
     }
-    case 6: {
-        uint16_t ext = er_next(er);
-        int xreg  = (ext >> 12) & 7;
-        int8_t d8 = (int8_t)(ext & 0xFF);
-        snprintf(out_expr, 256,
-                 "(uint32_t)(g_cpu.A[%d] + "
-                 "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
-                 reg, ext, xreg, xreg, (int)d8);
+    case 6:
+        emit_index_ea(er, reg, 0, u_suffix, out_expr, 256);
         break;
-    }
     case 7:
         switch (reg) {
         case 0: {
@@ -580,14 +609,7 @@ static void emit_ea_addr_ex(FILE *f, const M68KInstr *instr, int ea,
         }
         case 3: {
             uint32_t pc_addr = instr->addr + er->bp;
-            uint16_t ext = er_next(er);
-            int xreg  = (ext >> 12) & 7;
-            int8_t d8 = (int8_t)(ext & 0xFF);
-            snprintf(out_expr, 256,
-                     u_suffix
-                       ? "(uint32_t)(0x%08Xu + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))"
-                       : "(uint32_t)(0x%08X + m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
-                     pc_addr, ext, xreg, xreg, (int)d8);
+            emit_index_ea(er, -1, pc_addr, u_suffix, out_expr, 256);
             break;
         }
         default:
@@ -677,12 +699,9 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
         break;
     }
     case 6: { /* (d8,An,Xn) */
-        uint16_t ext = er_next(er);
-        int xreg  = (ext >> 12) & 7;
-        int8_t d8 = (int8_t)(ext & 0xFF);
-        fprintf(f, "  %s((uint32_t)(g_cpu.A[%d] + "
-                "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d)), (%s)(%s));\n",
-                wf, reg, ext, xreg, xreg, (int)d8, ct, val_expr);
+        char ea_s[200];
+        emit_index_ea(er, reg, 0, false, ea_s, sizeof ea_s);
+        fprintf(f, "  %s(%s, (%s)(%s));\n", wf, ea_s, ct, val_expr);
         break;
     }
     case 7:
@@ -1328,6 +1347,42 @@ static int probe_offset_table_targets(const GenesisRom *rom,
  *   - The offset-table walk stops on the first entry that's out-of-range
  *     or fails to decode, so it can't "run away" into garbage data.
  * ========================================================================= */
+/* =========================================================================
+ * sasc_switch_table — the SAS/C two-step switch:
+ *
+ *       move.w  T(pc,Dn.w),Dm      ; 303B/323B/... + brief ext
+ *       jmp     B(pc,Dm.w)         ; 4EFB + brief ext, B = jmp+2+d8
+ *   T:  dc.w    case0-B, case1-B, ...
+ *   B:  ...
+ *
+ * The offsets in the table at T are relative to B, not to T, so neither the
+ * offset-table probe (table AT the jmp base) nor the Duff probe matches it.
+ * The table normally sits between the jmp and B: its length is (B - T) / 2;
+ * otherwise it is walked up to 64 entries. Returns the entry count (0 = not
+ * this pattern) and the table address and base in *t / *b.
+ * ========================================================================= */
+static int sasc_switch_table(const GenesisRom *rom, const M68KInstr *jmp_instr,
+                             uint32_t *t, uint32_t *b)
+{
+    if (!rom || !jmp_instr || jmp_instr->src_ea != 0x3B ||
+        jmp_instr->word_count < 2 || (jmp_instr->words[1] & 0x0100))
+        return 0;
+    uint16_t jext = jmp_instr->words[1];
+    if (jext & 0x8000) return 0;                        /* index must be Dm */
+    uint32_t m_addr = jmp_instr->addr - 4;
+    if (m_addr + 3 >= rom->rom_size) return 0;
+    uint16_t mop  = rom_read16(rom, m_addr);
+    uint16_t mext = rom_read16(rom, m_addr + 2);
+    /* move.w (d8,PC,Xn),Dm with Dm = the jmp's index register */
+    if ((mop & 0xF1FF) != 0x303B || ((mop >> 9) & 7) != ((jext >> 12) & 7))
+        return 0;
+    if (mext & 0x0100) return 0;
+    *t = (uint32_t)(m_addr + 2 + (int32_t)(int8_t)(mext & 0xFF));
+    *b = (uint32_t)(jmp_instr->addr + 2 + (int32_t)(int8_t)(jext & 0xFF));
+    int n = (*t < *b && *b - *t <= 2u * 256u) ? (int)((*b - *t) / 2u) : 64;
+    return n;
+}
+
 static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
                                          const M68KInstr *jmp_instr,
                                          AddrSet *worklist,
@@ -1338,6 +1393,28 @@ static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
     if (!jmp_instr || jmp_instr->word_count < 2) return;
     /* Only (d8, PC, Xn): src_ea encoding 7<<3 | 3 = 0x3B. */
     if (jmp_instr->src_ea != 0x3B) return;
+
+    /* SAS/C two-step switch: seed every case target (relative to B) that
+     * lies inside this function's plausible range. */
+    {
+        uint32_t t, b;
+        int n = sasc_switch_table(rom, jmp_instr, &t, &b);
+        if (n > 0) {
+            uint32_t plausible_end = start_addr + 0x4000u;
+            for (int i = 0; i < nfuncs; i++)
+                if (sorted_funcs[i] > start_addr && sorted_funcs[i] < plausible_end)
+                    plausible_end = sorted_funcs[i];
+            for (int i = 0; i < n; i++) {
+                int16_t off = (int16_t)rom_read16(rom, t + 2u * (uint32_t)i);
+                uint32_t tg = (uint32_t)((int32_t)b + off);
+                if (tg & 1u || tg < start_addr || tg >= plausible_end) break;
+                M68KInstr probe;
+                if (!m68k_decode(rom, tg, &probe)) break;
+                addrset_insert(worklist, tg);
+            }
+            return;
+        }
+    }
 
     uint16_t ext  = jmp_instr->words[1];
     int8_t   d8   = (int8_t)(ext & 0xFF);
@@ -2605,7 +2682,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                                      estimate_cycles(instr));
             }
         } else if (mode == 2 || mode == 5 || mode == 6 ||
-                   (mode == 7 && (reg == 0 || reg == 1))) {
+                   (mode == 7 && (reg == 0 || reg == 1)) ||
+                   (mode == 7 && reg == 3 && (instr->words[1] & 0x0100))) {
+            /* (the last: a 68020 full-format (PC,Xn) — not a table jump) */
             audit_record(instr->addr, func_addr, 0,
                          JMPAUDIT_DYNAMIC_REGISTER, 0);
             char ae[256];
@@ -2629,6 +2708,40 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             int8_t d8 = (int8_t)(ext & 0xFF);
             const char *xr = xtype ? "g_cpu.A" : "g_cpu.D";
             uint32_t base = pc_addr + (int32_t)d8;
+
+            /* SAS/C two-step switch (sasc_switch_table): Dm holds the
+             * offset loaded from the table, relative to base. */
+            {
+                uint32_t st_t, st_b;
+                int nst = sasc_switch_table(rom, instr, &st_t, &st_b);
+                int32_t offs[256];
+                int nofs = 0;
+                for (int i = 0; i < nst && nofs < 256; i++) {
+                    int16_t off = (int16_t)rom_read16(rom, st_t + 2u * (uint32_t)i);
+                    uint32_t tg = (uint32_t)((int32_t)st_b + off);
+                    if (!addrset_contains(instrs, tg)) break;
+                    int dup = 0;
+                    for (int s = 0; s < nofs; s++) if (offs[s] == off) { dup = 1; break; }
+                    if (!dup) offs[nofs++] = off;
+                }
+                if (nofs > 0) {
+                    audit_record(instr->addr, func_addr, base,
+                                 JMPAUDIT_IN_FUNCTION_SWITCH, nofs);
+                    fprintf(f, "  /* SAS/C switch at $%06X: table $%06X, offsets from $%06X */\n",
+                            instr->addr, st_t, st_b);
+                    emit_cycle_accounting(f, "  ", estimate_cycles(instr));
+                    fprintf(f, "  switch ((int32_t)m68k_brief_index_value(0x%04Xu, "
+                            "g_cpu.D[%d], g_cpu.A[%d])) {\n", ext, xreg, xreg);
+                    for (int s = 0; s < nofs; s++)
+                        fprintf(f, "    case %d: goto label_%06X;\n", offs[s],
+                                (uint32_t)((int32_t)st_b + offs[s]));
+                    fprintf(f, "    default: hybrid_jmp_interpret(0x%08Xu + "
+                            "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d])); return;\n",
+                            base, ext, xreg, xreg);
+                    fprintf(f, "  }\n");
+                    break;
+                }
+            }
 
             uint32_t pc_targets[32];
             int npc = probe_pc_idx_targets(rom, instr, instrs, pc_targets,
@@ -2881,7 +2994,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         int dst_ea  = instr->dst_ea;
         int src_mode = (src_ea >> 3) & 7;
         int src_reg  = src_ea & 7;
-        int src_ext  = ea_ext_words_count(src_mode, src_reg, sz);
+        int src_ext  = ea_ext_words_at(instr, 1, src_mode, src_reg, sz);
 
         /* ExtReader for source starting at wi=1 */
         ExtReader er_src;
@@ -3399,6 +3512,125 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
     }
 
     /* ------------------------------------------------------------------ */
+    case MN_EXTB: {   /* 68020: sign-extend byte to long */
+        int dreg = instr->reg;
+        fprintf(f, "  g_cpu.D[%d] = (uint32_t)(int32_t)(int8_t)g_cpu.D[%d];\n", dreg, dreg);
+        char expr[64];
+        snprintf(expr, sizeof(expr), "g_cpu.D[%d]", dreg);
+        emit_flags_logic(f, expr, M68K_SIZE_L);
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case MN_MULL: {   /* 68020: MULU.L / MULS.L <ea>,Dl or <ea>,Dh:Dl */
+        uint16_t ext = instr->words[1];
+        int dl = (ext >> 12) & 7, dh = ext & 7;
+        int sgn = (ext & 0x0800) != 0, quad = (ext & 0x0400) != 0;
+        ExtReader er2;
+        er_init_at(&er2, instr, 2);
+        emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_L, &er2, tmp, src_expr);
+        if (sgn)
+            fprintf(f, "  { int64_t _r = (int64_t)(int32_t)(%s) * (int64_t)(int32_t)g_cpu.D[%d];\n",
+                    src_expr, dl);
+        else
+            fprintf(f, "  { int64_t _r = (int64_t)((uint64_t)(uint32_t)(%s) * (uint64_t)g_cpu.D[%d]);\n",
+                    src_expr, dl);
+        fprintf(f, "    g_cpu.SR &= ~0x0Fu;\n");
+        if (quad) {
+            fprintf(f, "    g_cpu.D[%d] = (uint32_t)((uint64_t)_r >> 32); g_cpu.D[%d] = (uint32_t)_r;\n"
+                       "    if (_r == 0) g_cpu.SR |= (1u<<2);\n"
+                       "    if ((uint64_t)_r >> 63) g_cpu.SR |= (1u<<3);\n", dh, dl);
+        } else {
+            fprintf(f, "    g_cpu.D[%d] = (uint32_t)_r;\n"
+                       "    if ((uint32_t)_r == 0u) g_cpu.SR |= (1u<<2);\n"
+                       "    if ((uint32_t)_r >> 31) g_cpu.SR |= (1u<<3);\n", dl);
+            if (sgn)
+                fprintf(f, "    if (_r != (int64_t)(int32_t)_r) g_cpu.SR |= (1u<<1);\n");
+            else
+                fprintf(f, "    if ((uint64_t)_r >> 32) g_cpu.SR |= (1u<<1);\n");
+        }
+        fprintf(f, "  }\n");
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case MN_DIVL: {   /* 68020: DIVU.L / DIVS.L / DIVUL.L / DIVSL.L */
+        uint16_t ext = instr->words[1];
+        int dq = (ext >> 12) & 7, dr = ext & 7;
+        int sgn = (ext & 0x0800) != 0, quad = (ext & 0x0400) != 0;
+        ExtReader er2;
+        er_init_at(&er2, instr, 2);
+        char tmp2[32];
+        snprintf(tmp2, sizeof(tmp2), "_tv%06X", addr);
+        emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_L, &er2, tmp2, src_expr);
+        /* As DIVU/DIVS above: a zero divisor only clears N/Z/V (no trap);
+         * on overflow V is set and the registers are left unchanged. */
+        fprintf(f, "  { uint32_t _dv = (uint32_t)(%s);\n"
+                   "    g_cpu.SR &= ~(1u<<0);\n"
+                   "    if (_dv == 0u) { g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)); }\n"
+                   "    else {\n", src_expr);
+        if (sgn) {
+            if (quad)
+                fprintf(f, "      int64_t _n = (int64_t)(((uint64_t)g_cpu.D[%d] << 32) | g_cpu.D[%d]);\n", dr, dq);
+            else
+                fprintf(f, "      int64_t _n = (int64_t)(int32_t)g_cpu.D[%d];\n", dq);
+            fprintf(f, "      int64_t _d = (int64_t)(int32_t)_dv;\n"
+                       "      int _ov = (_n == INT64_MIN && _d == -1);\n"
+                       "      int64_t _q = _ov ? 0 : _n / _d, _m = _ov ? 0 : _n %% _d;\n"
+                       "      if (_ov || _q != (int64_t)(int32_t)_q) { g_cpu.SR |= (1u<<1); }\n");
+        } else {
+            if (quad)
+                fprintf(f, "      uint64_t _n = ((uint64_t)g_cpu.D[%d] << 32) | g_cpu.D[%d];\n", dr, dq);
+            else
+                fprintf(f, "      uint64_t _n = g_cpu.D[%d];\n", dq);
+            fprintf(f, "      uint64_t _q = _n / _dv, _m = _n %% _dv;\n"
+                       "      if (_q >> 32) { g_cpu.SR |= (1u<<1); }\n");
+        }
+        fprintf(f, "      else {\n");
+        if (dr != dq)
+            fprintf(f, "        g_cpu.D[%d] = (uint32_t)_m;\n", dr);
+        else
+            fprintf(f, "        (void)_m;\n");
+        fprintf(f, "        g_cpu.D[%d] = (uint32_t)_q;\n"
+                   "        g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1));\n"
+                   "        if ((uint32_t)_q == 0u) g_cpu.SR |= (1u<<2);\n"
+                   "        if ((uint32_t)_q >> 31) g_cpu.SR |= (1u<<3);\n"
+                   "      }\n"
+                   "    }\n"
+                   "  }\n", dq);
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
+    case MN_BITFIELD: {   /* 68020: BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/BFFFO/BFSET/BFINS */
+        uint16_t ext = instr->words[1];
+        int op = (int)instr->imm32;
+        int ea = instr->src_ea, ea_mode = (ea >> 3) & 7;
+        char off[64], wid[64], where[256];
+        if (ext & 0x0800) snprintf(off, sizeof off, "(int32_t)g_cpu.D[%d]", (ext >> 6) & 7);
+        else snprintf(off, sizeof off, "%d", (ext >> 6) & 31);
+        if (ext & 0x0020) snprintf(wid, sizeof wid, "g_cpu.D[%d]", ext & 7);
+        else snprintf(wid, sizeof wid, "%uu", (unsigned)(ext & 31));
+        if (ea_mode == 0) {
+            snprintf(where, sizeof where, "0u");
+        } else {
+            ExtReader er2;
+            er_init_at(&er2, instr, 2);
+            emit_ea_addr_ex(f, instr, ea, &er2, where, true);
+        }
+        /* m68k_bitfield (runner): does the operation, sets N/Z (V=C=0),
+         * returns the extracted field / first-one offset */
+        fprintf(f, "  { uint32_t _bf = m68k_bitfield(%d, %d, %s, %s, %s, g_cpu.D[%d]);\n",
+                op, ea_mode == 0 ? (ea & 7) : -1, where, off, wid, (ext >> 12) & 7);
+        if (op == 1 || op == 3 || op == 5)
+            fprintf(f, "    g_cpu.D[%d] = _bf;\n", (ext >> 12) & 7);
+        else
+            fprintf(f, "    (void)_bf;\n");
+        fprintf(f, "  }\n");
+        break;
+    }
+
+    /* ------------------------------------------------------------------ */
     case MN_LSL:
     case MN_LSR: {
         if (instr->mem_shift) { emit_mem_shift(f, instr, addr, &er); break; }
@@ -3790,16 +4022,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                      "(uint32_t)(g_cpu.A[%d] + (int32_t)%d)", reg, (int)d16);
             break;
         }
-        case 6: {
-            uint16_t ext = er_next(&er2);
-            int xreg  = (ext >> 12) & 7;
-            int8_t d8 = (int8_t)(ext & 0xFF);
-            snprintf(base_expr, sizeof(base_expr),
-                     "(uint32_t)(g_cpu.A[%d] + "
-                     "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
-                     reg, ext, xreg, xreg, (int)d8);
+        case 6:
+            emit_index_ea(&er2, reg, 0, false, base_expr, sizeof(base_expr));
             break;
-        }
         case 7:
             switch (reg) {
             case 0: {
@@ -3825,13 +4050,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             }
             case 3: {  /* (d8,PC,Xn) — PC-relative indexed */
                 uint32_t pc_addr = instr->addr + er2.bp;
-                uint16_t ext = er_next(&er2);
-                int xreg  = (ext >> 12) & 7;
-                int8_t d8 = (int8_t)(ext & 0xFF);
-                snprintf(base_expr, sizeof(base_expr),
-                         "(uint32_t)(0x%08X + "
-                         "m68k_brief_index_value(0x%04Xu, g_cpu.D[%d], g_cpu.A[%d]) + (%d))",
-                         pc_addr, ext, xreg, xreg, (int)d8);
+                emit_index_ea(&er2, -1, pc_addr, false, base_expr, sizeof(base_expr));
                 break;
             }
             default:

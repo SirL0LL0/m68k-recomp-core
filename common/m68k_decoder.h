@@ -124,9 +124,22 @@ typedef enum {
     MN_RESET,
     MN_TRAPV,
     MN_ILLEGAL,
+    /* 68020 additions:
+     *   MN_EXTB     — EXTB.L Dn (0x49C0)
+     *   MN_MULL     — MULU.L/MULS.L, words[1] = Dl | signed | 64-bit | Dh
+     *   MN_DIVL     — DIVU.L/DIVS.L/DIVxL.L, words[1] = Dq | signed | 64 | Dr
+     *   MN_BITFIELD — BFTST..BFINS, imm32 = operation (0..7), words[1] =
+     *                 register | offset (Do) | width (Dw)
+     * Indexed EAs may use the full extension format (bit 8 of the extension
+     * word): see m68k_full_ext_extra_words(). */
+    MN_EXTB,
+    MN_MULL,
+    MN_DIVL,
+    MN_BITFIELD,
 } M68KMnemonic;
 
-#define M68K_MAX_WORDS 8   /* Maximum instruction length in 16-bit words */
+#define M68K_MAX_WORDS 16  /* Maximum instruction length in 16-bit words
+                              (68020 full-format EAs on both operands) */
 
 typedef struct {
     uint32_t     addr;                    /* ROM address of this instruction */
@@ -177,5 +190,7 @@ typedef struct {
 #define PCR_IMM     4
 
 bool m68k_decode(const GenesisRom *rom, uint32_t addr, M68KInstr *out);
+/* words after a 68020 full-format index extension word (0 for brief) */
+int  m68k_full_ext_extra_words(uint16_t ext);
 bool m68k_is_terminator(const M68KInstr *instr);
 bool m68k_is_call(const M68KInstr *instr);
