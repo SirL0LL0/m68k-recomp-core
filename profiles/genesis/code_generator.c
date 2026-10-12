@@ -176,6 +176,10 @@ static uint32_t er_next_imm(ExtReader *er, M68KSize sz) {
  * ea_ext_words_count — mirrors m68k_decoder.c logic
  * ========================================================================= */
 
+/* game.toml stack_skip_detection (set by codegen_emit): false for compiled
+ * code, where RTS is always a plain return to the caller */
+static bool s_stack_skip = true;
+
 static int ea_ext_words_count(int mode, int reg, M68KSize size) {
     switch (mode) {
     case 0: case 1: case 2: case 3: case 4: return 0;
@@ -446,13 +450,20 @@ static void emit_ea_load_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize sz
     const char *ct = size_ctype(sz);
     const char *rf = size_read_fn(sz);
     int sb = size_bytes(sz);
+    /* byte operations on (A7)+ / -(A7) move the stack pointer by 2: it
+     * stays word aligned (68000 rule) */
+    if (reg == 7 && sb == 1 && (mode == 3 || mode == 4)) sb = 2;
 
     switch (mode) {
     case 0: /* Dn */
         snprintf(out_expr, 256, "(%s)g_cpu.D[%d]", ct, reg);
         break;
     case 1: /* An */
-        snprintf(out_expr, 256, "g_cpu.A[%d]", reg);
+        /* a copy taken now: in MOVE.L An,-(An) / (An)+ the destination
+         * changes An before the store, but the value written is the
+         * original An (68000 and 68020 alike; e.g. the NEWLIST macro) */
+        fprintf(f, "  uint32_t %s_an = g_cpu.A[%d];\n", tmp, reg);
+        snprintf(out_expr, 256, "%s_an", tmp);
         break;
     case 2: /* (An) */
         fprintf(f, "  %s %s = %s(g_cpu.A[%d]);\n", ct, tmp, rf, reg);
@@ -658,6 +669,8 @@ static void emit_ea_store_ex(FILE *f, const M68KInstr *instr, int ea, M68KSize s
     uint32_t    msk = size_mask(sz);
     int         sb  = size_bytes(sz);
     (void)instr;
+    /* byte stores to (A7)+ / -(A7): the stack pointer moves by 2 */
+    if (reg == 7 && sb == 1 && (mode == 3 || mode == 4)) sb = 2;
 
     switch (mode) {
     case 0: /* Dn */
@@ -1357,10 +1370,37 @@ static int probe_offset_table_targets(const GenesisRom *rom,
  *
  * The offsets in the table at T are relative to B, not to T, so neither the
  * offset-table probe (table AT the jmp base) nor the Duff probe matches it.
- * The table normally sits between the jmp and B: its length is (B - T) / 2;
- * otherwise it is walked up to 64 entries. Returns the entry count (0 = not
- * this pattern) and the table address and base in *t / *b.
+ * The table and B usually overlap (B = T + 2), so the entry count comes from
+ * the bounds check the compiler puts just before the move:
+ *       cmpi.l #N,Dn / cmpi.w #N,Dn,  then bge/bcc (N cases) or bgt/bhi (N+1)
+ * on the index register. Without one, a table lying entirely between the
+ * move and B gives (B - T) / 2 entries; otherwise the pattern is rejected.
+ * Returns the entry count (0 = not this pattern) and T and B in *t / *b.
  * ========================================================================= */
+static int sasc_switch_bound(const GenesisRom *rom, uint32_t m_addr, int xreg)
+{
+    /* the Bcc right before the move: .b (2 bytes) or .w (4 bytes) */
+    for (int bl = 2; bl <= 4; bl += 2) {
+        if (m_addr < (uint32_t)bl + 6) continue;
+        uint32_t bp = m_addr - (uint32_t)bl;
+        uint16_t bw = rom_read16(rom, bp);
+        if ((bw & 0xF000) != 0x6000) continue;
+        if (bl == 2 && ((bw & 0xFF) == 0 || (bw & 0xFF) == 0xFF)) continue;
+        if (bl == 4 && (bw & 0xFF) != 0) continue;
+        int cond = (bw >> 8) & 0xF;
+        int extra;
+        if (cond == 0xC || cond == 0x4) extra = 0;           /* bge / bcc */
+        else if (cond == 0xE || cond == 0x2) extra = 1;      /* bgt / bhi */
+        else continue;
+        uint16_t c6 = rom_read16(rom, bp - 6), c4 = rom_read16(rom, bp - 4);
+        if (c6 == (uint16_t)(0x0C80 | xreg))                 /* cmpi.l #imm32,Dn */
+            return (int)rom_read32(rom, bp - 4) + extra;
+        if (c4 == (uint16_t)(0x0C40 | xreg))                 /* cmpi.w #imm16,Dn */
+            return (int)(int16_t)rom_read16(rom, bp - 2) + extra;
+    }
+    return 0;
+}
+
 static int sasc_switch_table(const GenesisRom *rom, const M68KInstr *jmp_instr,
                              uint32_t *t, uint32_t *b)
 {
@@ -1379,8 +1419,11 @@ static int sasc_switch_table(const GenesisRom *rom, const M68KInstr *jmp_instr,
     if (mext & 0x0100) return 0;
     *t = (uint32_t)(m_addr + 2 + (int32_t)(int8_t)(mext & 0xFF));
     *b = (uint32_t)(jmp_instr->addr + 2 + (int32_t)(int8_t)(jext & 0xFF));
-    int n = (*t < *b && *b - *t <= 2u * 256u) ? (int)((*b - *t) / 2u) : 64;
-    return n;
+    int n = sasc_switch_bound(rom, m_addr, (mext >> 12) & 7);
+    if (n <= 0 && *t < *b && *b - *t >= 4 && *t > jmp_instr->addr)
+        n = (int)((*b - *t) / 2u);
+    if (n > 256) n = 256;
+    return n > 0 ? n : 0;
 }
 
 static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
@@ -1407,9 +1450,9 @@ static void seed_pc_idx_dispatch_targets(const GenesisRom *rom,
             for (int i = 0; i < n; i++) {
                 int16_t off = (int16_t)rom_read16(rom, t + 2u * (uint32_t)i);
                 uint32_t tg = (uint32_t)((int32_t)b + off);
-                if (tg & 1u || tg < start_addr || tg >= plausible_end) break;
+                if (tg & 1u || tg < start_addr || tg >= plausible_end) continue;
                 M68KInstr probe;
-                if (!m68k_decode(rom, tg, &probe)) break;
+                if (!m68k_decode(rom, tg, &probe)) continue;
                 addrset_insert(worklist, tg);
             }
             return;
@@ -1640,6 +1683,15 @@ static void scan_function(const GenesisRom *rom, uint32_t start_addr,
              instr.mnemonic == MN_BRA || instr.mnemonic == MN_JMP) &&
              instr.has_target && addrset_contains(instrs, instr.target_addr)) {
             addrset_insert(labels, instr.target_addr);
+        }
+        /* SAS/C switch: every case target inside the function is a label */
+        if (instr.mnemonic == MN_JMP && !instr.has_target) {
+            uint32_t t, b;
+            int n = sasc_switch_table(rom, &instr, &t, &b);
+            for (int k = 0; k < n; k++) {
+                uint32_t tg = (uint32_t)((int32_t)b + (int16_t)rom_read16(rom, t + 2u * (uint32_t)k));
+                if (addrset_contains(instrs, tg)) addrset_insert(labels, tg);
+            }
         }
     }
 
@@ -2426,7 +2478,13 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * through the C callers; a boolean loses the second unwind and
          * resumes code the guest deliberately skipped. Tail edges do not
          * consume this count; each actual JSR/BSR caller consumes one. */
-        if (*has_sp_adjust) {
+        if (!s_stack_skip) {
+            /* compiled code: the runtime compares A7 with its shadow stack
+             * of JSR slots; an RTS from a restored outer stack pointer
+             * (longjmp, exit, an error exit of an asm routine) unwinds
+             * exactly the frames in between */
+            fprintf(f, "  recomp_rts();\n");
+        } else if (*has_sp_adjust) {
             fprintf(f, "  if (_sp_popped > 0) { g_rte_pending = _sp_popped; _sp_popped = 0; }\n");
             fprintf(f, "  else if (g_split_sp_popped > 0) { g_rte_pending = g_split_sp_popped; g_split_sp_popped = 0; }\n");
         } else {
@@ -2606,6 +2664,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                         bsr_target);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
+            if (!s_stack_skip) fprintf(f, "  recomp_pop_slot();\n");
         } else if (mode == 2 || mode == 5 || mode == 6 ||
                    (mode == 7 && reg <= 3)) {
             char ae[256];
@@ -2614,6 +2673,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             fprintf(f, "    recomp_call_addr(%s);\n", ae);
             fprintf(f, "    g_split_sp_popped = _saved_split_sp_popped;\n");
             fprintf(f, "  }\n");
+            if (!s_stack_skip) fprintf(f, "  recomp_pop_slot();\n");
         } else {
             codegen_diag_record(CGD_TODO_DYNAMIC_JSR_UNSUPPORTED, addr,
                                 instr->words[0], instr->mnemonic,
@@ -2719,7 +2779,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
                 for (int i = 0; i < nst && nofs < 256; i++) {
                     int16_t off = (int16_t)rom_read16(rom, st_t + 2u * (uint32_t)i);
                     uint32_t tg = (uint32_t)((int32_t)st_b + off);
-                    if (!addrset_contains(instrs, tg)) break;
+                    if (!addrset_contains(instrs, tg)) continue;   /* resta al default */
                     int dup = 0;
                     for (int s = 0; s < nofs; s++) if (offs[s] == off) { dup = 1; break; }
                     if (!dup) offs[nofs++] = off;
@@ -3113,7 +3173,7 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
              * This discards return address(es) from the 68K stack.  The subsequent
              * RTS will return to the caller's caller.  Set a function-local flag
              * so this function's RTS sites propagate the return. */
-            if (reg == 7 && (imm % 4) == 0 && imm > 0) {
+            if (reg == 7 && (imm % 4) == 0 && imm > 0 && s_stack_skip) {
                 *has_sp_adjust = 1;
                 fprintf(f, "  _sp_popped += %u;\n", imm / 4);
             }
@@ -3387,8 +3447,10 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
          * silently zeroing the X flag set by the earlier subi.b in
          * PSGSetFreq — corrupting downstream Bcc paths that read X
          * (squelched notes, drift). */
+        /* a plain store, not RMW: there is no load to predecrement -(An)
+         * first (clr.l -(a7) pushes a zero argument in compiled code) */
         ExtReader er2; er_init(&er2, instr);
-        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 1);
+        emit_ea_store_ex(f, instr, instr->src_ea, sz, &er2, "0", 0);
         fprintf(f, "  g_cpu.SR = (g_cpu.SR & ~0x0Fu) | (1u<<2);\n");
         break;
     }
@@ -4773,6 +4835,7 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
                   const AnnotationTable *at, const GameConfig *cfg,
                   bool reverse_debug) {
     s_reverse_debug = reverse_debug;
+    s_stack_skip = !cfg || cfg->stack_skip_detection;
     free(s_candidate_owners);
     s_candidate_owners = NULL;
     s_candidate_owner_count = 0;
@@ -5125,7 +5188,9 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
          * cannot be classified as either an ordinary or an unconditional
          * return-capturing callee at the call site. */
         int has_sp_adjust = 0;
-        for (int j = 0; j < instrs.count; j++) {
+        /* compiled code (stack_skip_detection = false in game.toml): no
+         * counting, RTS is a plain return */
+        for (int j = 0; j < instrs.count && s_stack_skip; j++) {
             M68KInstr pre;
             if (m68k_decode(rom, instrs.addrs[j], &pre)) {
                 if ((pre.mnemonic == MN_ADDQ || pre.mnemonic == MN_ADDA) &&
