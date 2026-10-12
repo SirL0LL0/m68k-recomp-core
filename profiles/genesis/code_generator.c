@@ -3143,8 +3143,11 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
 
     /* ------------------------------------------------------------------ */
     case MN_PEA: {
+        /* the address is computed before A7 moves: pea 20(a7) pushes the
+         * old A7 + 20 (SAS/C builds va_list pointers this way) */
         emit_ea_addr(f, instr, instr->src_ea, &er, addr_expr);
-        fprintf(f, "  g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], %s);\n", addr_expr);
+        fprintf(f, "  { uint32_t _pea = (uint32_t)(%s); g_cpu.A[7] -= 4; m68k_write32(g_cpu.A[7], _pea); }\n",
+                addr_expr);
         if (*has_sp_adjust)
             fprintf(f, "  _sp_popped -= 1; /* PEA pushes one longword */\n");
         break;
