@@ -5554,7 +5554,10 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
     fprintf(f_dispatch,
         "uint32_t game_dispatch_table_addr(int i) {\n"
         "    return (i >= 0 && i < %d) ? s_dispatch_table[i].addr : 0;\n"
-        "}\n\n", all_funcs.count);
+        "}\n"
+        "void (*game_dispatch_table_fn(int i))(void) {\n"
+        "    return (i >= 0 && i < %d) ? s_dispatch_table[i].fn : 0;\n"
+        "}\n\n", all_funcs.count, all_funcs.count);
 
     /* game_hook sites, sorted, so the tier-3 interpreter can run the same
      * genesis_game_instruction_hook() callbacks as the generated code. */
@@ -5642,14 +5645,22 @@ bool codegen_emit(const GenesisRom *rom, const FunctionList *funcs,
         "        }\n"
         "    }\n"
         "}\n\n"
-        "void recomp_call_func(RecompFuncPtr fn) {\n"
-        "    if (!fn)\n"
-        "        return;\n"
+        "/* optional call hook (differential testing against an interpreter):\n"
+        " * returns 1 when it ran the call itself through recomp_call_func_direct */\n"
+        "int (*g_recomp_call_hook)(RecompFuncPtr fn);\n\n"
+        "void recomp_call_func_direct(RecompFuncPtr fn) {\n"
         "    RecompTailFrame frame = { 0, 0, g_recomp_tail_frame };\n"
         "    g_recomp_tail_frame = &frame;\n"
         "    fn();\n"
         "    recomp_drain_tailcalls(&frame);\n"
         "    g_recomp_tail_frame = frame.prev;\n"
+        "}\n\n"
+        "void recomp_call_func(RecompFuncPtr fn) {\n"
+        "    if (!fn)\n"
+        "        return;\n"
+        "    if (g_recomp_call_hook && g_recomp_call_hook(fn))\n"
+        "        return;\n"
+        "    recomp_call_func_direct(fn);\n"
         "}\n\n"
         "void recomp_call_addr(uint32_t addr) {\n"
         "    RecompTailFrame frame = { 0, 0, g_recomp_tail_frame };\n"
