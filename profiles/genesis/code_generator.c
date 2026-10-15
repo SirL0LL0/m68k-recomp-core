@@ -1430,7 +1430,7 @@ static int sasc_switch_table(const GenesisRom *rom, const M68KInstr *jmp_instr,
     int n = sasc_switch_bound(rom, m_addr, (mext >> 12) & 7);
     if (n <= 0 && *t < *b && *b - *t >= 4 && *t > jmp_instr->addr)
         n = (int)((*b - *t) / 2u);
-    if (n > 256) n = 256;
+    if (n > 2048) n = 2048;                 /* Total Chaos has a 757-case switch */
     return n > 0 ? n : 0;
 }
 
@@ -2782,9 +2782,9 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
             {
                 uint32_t st_t, st_b;
                 int nst = sasc_switch_table(rom, instr, &st_t, &st_b);
-                int32_t offs[256];
+                int32_t offs[2048];
                 int nofs = 0;
-                for (int i = 0; i < nst && nofs < 256; i++) {
+                for (int i = 0; i < nst && nofs < 2048; i++) {
                     int16_t off = (int16_t)rom_read16(rom, st_t + 2u * (uint32_t)i);
                     uint32_t tg = (uint32_t)((int32_t)st_b + off);
                     if (!addrset_contains(instrs, tg)) continue;   /* resta al default */
