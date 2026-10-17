@@ -3988,12 +3988,15 @@ static void emit_instr(FILE *f, const GenesisRom *rom,
         emit_ea_load(f, instr, instr->src_ea, M68K_SIZE_W, &er, tmp2, src_expr);
         /* HW-accurate (matches clown68000 / the Tier-3 floor): on quotient
          * overflow set V+N, clear Z, leave Dn UNCHANGED. C always cleared.
-         * On real inputs this is identical to a plain divide (no overflow). */
+         * On real inputs this is identical to a plain divide (no overflow).
+         * The quotient fits in 16 bits only if divisor > dividend high word:
+         * with divisor == high word the quotient is exactly 0x10000, which
+         * is an overflow (req.library's list scroller relies on it). */
         fprintf(f,
             "  { uint16_t _dv = (uint16_t)(%s); uint32_t _dest = g_cpu.D[%d];\n"
             "    g_cpu.SR &= ~(1u<<0);\n"
             "    if (_dv == 0u) { g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1)); }\n"
-            "    else if ((uint32_t)_dv >= (_dest >> 16)) {\n"
+            "    else if ((uint32_t)_dv > (_dest >> 16)) {\n"
             "      uint32_t _quo = _dest / _dv, _rem = _dest %% _dv;\n"
             "      g_cpu.D[%d] = (_quo & 0xFFFFu) | ((_rem & 0xFFFFu) << 16);\n"
             "      g_cpu.SR &= ~((1u<<3)|(1u<<2)|(1u<<1));\n"
